@@ -1,6 +1,7 @@
 #import necessary libraries
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from sklearn.preprocessing import OrdinalEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
@@ -69,11 +70,23 @@ model.fit(X_train, y_train)
 
 #make predictions
 y_pred = model.predict(X_test)
-model.score(X_test, y_test)
-
-#evaluate model
-log_loss(y, model.predict_proba(X)[:,1])
 
 #get beta values for features
 betas = model.coef_[0]
 betas
+betas_df = pd.DataFrame({
+    'feature': ['L_P_zs', 'L_R_zs', 'L_A_zs', 'T_P_zs', 'T_R_zs', 'T_A_zs'],
+    'beta': betas
+}).sort_values('beta', ascending=False).set_index('feature')
+betas_plot = betas_df.plot(kind='barh', title='Beta Values for Each Feature').invert_yaxis()
+plt.show()
+
+#evaluate model
+score = model.score(X_test, y_test)
+log_loss = log_loss(y, model.predict_proba(X)[:,1])
+confusion_matrix = confusion_matrix(y_test, y_pred)
+classification_report = classification_report(y_test, y_pred)
+print('Model Score:', score)
+print('Log Loss:', log_loss)
+print('Confusion Matrix:\n', confusion_matrix)
+print('Classification Report:\n', classification_report)
