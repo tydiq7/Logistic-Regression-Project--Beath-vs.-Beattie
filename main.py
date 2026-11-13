@@ -1,132 +1,147 @@
-#Import necessary libraries
+"""Beath vs. Beattie: which player's per-half performance better predicts a UCSD win?
+
+Evaluation uses game-grouped 5-fold cross-validation (both halves of a game always land
+in the same fold) and compares the model against a majority-class baseline.
+"""
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.preprocessing import OrdinalEncoder
-from sklearn.model_selection import train_test_split
+from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import log_loss, accuracy_score, confusion_matrix, classification_report
-from sklearn.metrics import roc_curve, auc
+from sklearn.metrics import accuracy_score, confusion_matrix, log_loss, roc_auc_score, roc_curve
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
-#Read dataset
-raw_df = pd.read_csv(r"C:\Users\aravk\OneDrive\Documents\GitHub\Logistic-Regression-Project--Beath-vs.-Beattie\data\Logistic Regression Project Raw Data.csv")
-raw_df
+# Paths are relative to this file, so the script runs from a fresh clone on any machine.
+ROOT = Path(__file__).resolve().parent
+DATA_PATH = ROOT / "data" / "Logistic Regression Project Raw Data.csv"
+FIG_DIR = ROOT / "Figures"
 
-#Save games with non-bibary (W/L) outcomes to a separate dataframe
-tied_half = raw_df[(raw_df.get('Outcome') != 'W') & (raw_df.get('Outcome') != 'L')].set_index('GameID')
+FEATURES = ["L_Points", "L_Rebounds", "L_Assists", "T_Points", "T_Rebounds", "T_Assists"]
+N_SPLITS = 5
+SEED = 42
 
-#Clean data
-raw_df = raw_df.set_index('GameID')
-cleaned_df = raw_df.drop(tied_half.index)
 
-#Convert outcome to binary
-outcomes = ['L', 'W']
-enc = OrdinalEncoder(categories=[outcomes])
-cleaned_df['Outcome'] = enc.fit_transform(cleaned_df[['Outcome']])
+# ----------------------------------------------------------------------------- data
+def load_data(path=DATA_PATH):
+    """Load the raw CSV, drop non-binary outcomes (ties) and encode L=0, W=1."""
+    df = pd.read_csv(path)
+    df = df[df["Outcome"].isin(["W", "L"])].copy()
+    df["Outcome"] = (df["Outcome"] == "W").astype(int)
+    return df.reset_index(drop=True)
 
-#Find P/R/A averages for each player
-leo_points_avg = cleaned_df['L_Points'].mean()
-leo_rebounds_avg = cleaned_df['L_Rebounds'].mean()
-leo_assists_avg = cleaned_df['L_Assists'].mean()
-tom_points_avg = cleaned_df['T_Points'].mean()
-tom_rebounds_avg = cleaned_df['T_Rebounds'].mean()
-tom_assists_avg = cleaned_df['T_Assists'].mean()
 
-#Replace P/R/A with relative P/R/A by finding change in performance relative to averages
-finished_df = cleaned_df.assign(L_PminusAvg = (cleaned_df.get('L_Points') - leo_points_avg).round(3))
-finished_df = finished_df.assign(L_RminusAvg = (cleaned_df.get('L_Rebounds') - leo_rebounds_avg).round(3))
-finished_df = finished_df.assign(L_AminusAvg = (cleaned_df.get('L_Assists') - leo_assists_avg).round(3))
-finished_df = finished_df.assign(T_PminusAvg = (cleaned_df.get('T_Points') - tom_points_avg).round(3))
-finished_df = finished_df.assign(T_RminusAvg = (cleaned_df.get('T_Rebounds') - tom_rebounds_avg).round(3))
-finished_df = finished_df.assign(T_AminusAvg = (cleaned_df.get('T_Assists') - tom_assists_avg).round(3))
-finished_df.drop(columns=['L_Points', 'L_Rebounds', 'L_Assists', 'T_Points', 'T_Rebounds', 'T_Assists'], inplace=True)
+# ----------------------------------------------------------------------------- models
+def make_model():
+    """Standardize each stat, then fit a logistic regression.
 
-#Calculate standard deviations of relative P/R/A
-leo_points_std = finished_df['L_PminusAvg'].std(ddof=0)
-leo_rebounds_std = finished_df['L_RminusAvg'].std(ddof=0)
-leo_assists_std = finished_df['L_AminusAvg'].std(ddof=0)
-tom_points_std = finished_df['T_PminusAvg'].std(ddof=0)
-tom_rebounds_std = finished_df['T_RminusAvg'].std(ddof=0)
-tom_assists_std = finished_df['T_AminusAvg'].std(ddof=0)
+    Standardizing inside the pipeline means each CV fold learns its means/stds from its
+    training rows only, so nothing about the held-out games leaks into the model.
+    """
+    return make_pipeline(StandardScaler(), LogisticRegression(l1_ratio=0, C=1.0))
 
-#Apply z-score normalization on relative P/R/A
-finished_df = finished_df.assign(L_P_zs = ((finished_df.get('L_PminusAvg')) / leo_points_std).round(3))
-finished_df = finished_df.assign(L_R_zs = ((finished_df.get('L_RminusAvg')) / leo_rebounds_std).round(3))
-finished_df = finished_df.assign(L_A_zs = ((finished_df.get('L_AminusAvg')) / leo_assists_std).round(3))
-finished_df = finished_df.assign(T_P_zs = ((finished_df.get('T_PminusAvg')) / tom_points_std).round(3))
-finished_df = finished_df.assign(T_R_zs = ((finished_df.get('T_RminusAvg')) / tom_rebounds_std).round(3))
-finished_df = finished_df.assign(T_A_zs = ((finished_df.get('T_AminusAvg')) / tom_assists_std).round(3))
-finished_df.drop(columns=['L_PminusAvg', 'L_RminusAvg', 'L_AminusAvg', 'T_PminusAvg', 'T_RminusAvg', 'T_AminusAvg'], inplace=True)
-finished_df
 
-#Split data into training and testing sets
-X = finished_df.drop(columns=['Half', 'Outcome'])
-y = finished_df['Outcome']
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+def make_baseline():
+    """Always predicts the training-set class prior (no skill by construction)."""
+    return DummyClassifier(strategy="prior")
 
-#Train logistic regression model
-model = LogisticRegression(l1_ratio=0, C=1.0)
-model.fit(X_train, y_train)
 
-#Make predictions
-y_pred = model.predict(X_test)
-y_pred_proba = model.predict_proba(X_test)[:,1]
+# ----------------------------------------------------------------------------- evaluation
+def score_predictions(y_true, proba):
+    """AUC, accuracy and log-loss for one set of held-out predictions."""
+    auc = roc_auc_score(y_true, proba) if len(np.unique(y_true)) == 2 else np.nan
+    return {
+        "AUC": auc,
+        "Accuracy": accuracy_score(y_true, proba >= 0.5),
+        "Log-loss": log_loss(y_true, proba, labels=[0, 1]),
+    }
 
-#Get beta values for features
-betas = model.coef_[0]
-betas
-betas_df = pd.DataFrame({
-    'feature': ['L_P_zs', 'L_R_zs', 'L_A_zs', 'T_P_zs', 'T_R_zs', 'T_A_zs'],
-    'beta': betas
-}).sort_values('beta', ascending=False).set_index('feature')
-betas_plot = betas_df.plot(kind='barh', title='Beta Values for Each Feature').invert_yaxis()
 
-#Evaluate model
-score = model.score(X_test, y_test)
-log_loss = log_loss(y, model.predict_proba(X)[:,1])
-confusion_matrix = confusion_matrix(y_test, y_pred)
-classification_report = classification_report(y_test, y_pred)
+def cross_validate(make_estimator, X, y, groups):
+    """Game-grouped CV. Returns per-fold metrics and pooled out-of-fold probabilities."""
+    cv = StratifiedGroupKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
+    oof = np.zeros(len(y))
+    fold_rows = []
+    for train_idx, test_idx in cv.split(X, y, groups):
+        est = make_estimator().fit(X.iloc[train_idx], y.iloc[train_idx])
+        oof[test_idx] = est.predict_proba(X.iloc[test_idx])[:, 1]
+        fold_rows.append(score_predictions(y.iloc[test_idx], oof[test_idx]))
+    return pd.DataFrame(fold_rows), oof
 
-#Plot evaluation metrics
 
-#model score
-plt.figure(figsize=(4,4))
-plt.bar(['Model Score'], [score], color='green')
-plt.ylim(0, 1)
-plt.title('Model Score (Accuracy)')
-plt.show()
+def summarize(name, fold_df):
+    """Mean and std across folds, as 'mean ± std' strings in a one-row frame."""
+    mean, std = fold_df.mean(), fold_df.std(ddof=1)
+    return pd.Series({m: f"{mean[m]:.3f} ± {std[m]:.3f}" for m in fold_df.columns}, name=name)
 
-#log loss
-plt.figure(figsize=(4,4))
-plt.bar(['Log Loss'], [log_loss], color='green')
-plt.axhline(y=0.5, color='red', linestyle='--', label='"Good" Threshold')
-plt.legend(loc='upper right')
-plt.ylim(0, log_loss + 1)
-plt.title('Log Loss')
-plt.show()
 
-#confusion matrix
-plt.figure(figsize=(6,4))
-sns.heatmap(confusion_matrix, annot=True, fmt='d', cmap='Blues')
-plt.xlabel('Predicted')
-plt.ylabel('Actual')
-plt.title('Confusion Matrix')
-plt.show()
+# ----------------------------------------------------------------------------- plotting
+def save_fig(fig, name):
+    FIG_DIR.mkdir(exist_ok=True)
+    fig.savefig(FIG_DIR / f"{name}.png", dpi=150, bbox_inches="tight")
 
-#classification report
-print('Classification Report:\n', classification_report)
 
-#Calculate ROC curve and AUC
-fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba)
-roc_auc = auc(fpr, tpr)
-plt.figure()
-plt.plot(fpr, tpr, color='blue', label='ROC curve (area = %0.2f)' % roc_auc)
-plt.plot([0, 1], [0, 1], color='red', linestyle='--', label='No Skill')
-plt.xlim([0.0, 1.0])
-plt.ylim([0.0, 1.05])
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('ROC Curve for UCSD Game Outcome Classification')
-plt.legend(loc='lower right')
-plt.show()
+def plot_betas(betas):
+    ax = betas.sort_values().plot(kind="barh", title="Beta Values for Each Feature (standardized)", legend=False)
+    ax.set_xlabel("Coefficient")
+    save_fig(ax.figure, "Beta Values")
+
+
+def plot_metrics_vs_baseline(model_folds, baseline_folds):
+    means = pd.DataFrame({"Model": model_folds.mean(), "Baseline": baseline_folds.mean()})
+    errs = pd.DataFrame({"Model": model_folds.std(ddof=1), "Baseline": baseline_folds.std(ddof=1)})
+    ax = means.plot(kind="bar", yerr=errs, capsize=4, rot=0, figsize=(6, 4),
+                    title="Held-out metrics (5-fold, game-grouped)")
+    ax.set_ylabel("Score (log-loss: lower is better)")
+    save_fig(ax.figure, "Metrics vs Baseline")
+
+
+def plot_confusion(y, oof):
+    fig, ax = plt.subplots(figsize=(6, 4))
+    sns.heatmap(confusion_matrix(y, oof >= 0.5), annot=True, fmt="d", cmap="Blues", ax=ax)
+    ax.set(xlabel="Predicted", ylabel="Actual", title="Confusion Matrix (out-of-fold)")
+    save_fig(fig, "Confusion Matrix Heatmap")
+
+
+def plot_roc(y, oof):
+    fpr, tpr, _ = roc_curve(y, oof)
+    fig, ax = plt.subplots()
+    ax.plot(fpr, tpr, color="blue", label=f"Model, pooled out-of-fold (AUC = {roc_auc_score(y, oof):.2f})")
+    ax.plot([0, 1], [0, 1], color="red", linestyle="--", label="No Skill")
+    ax.set(xlim=(0, 1), ylim=(0, 1.05), xlabel="False Positive Rate", ylabel="True Positive Rate",
+           title="ROC Curve for UCSD Game Outcome Classification")
+    ax.legend(loc="lower right")
+    save_fig(fig, "ROC Curve")
+
+
+# ----------------------------------------------------------------------------- main
+def main():
+    df = load_data()
+    X, y, groups = df[FEATURES], df["Outcome"], df["GameID"]
+    print(f"{len(df)} halves from {groups.nunique()} games; win rate = {y.mean():.2f}")
+
+    model_folds, oof = cross_validate(make_model, X, y, groups)
+    baseline_folds, _ = cross_validate(make_baseline, X, y, groups)
+
+    print(f"\nHeld-out metrics, mean ± std over {N_SPLITS} game-grouped folds:")
+    print(pd.DataFrame([summarize("Model", model_folds), summarize("Baseline", baseline_folds)]).to_string())
+
+    # Coefficients come from a fit on all data and are for interpretation only, not evaluation.
+    final = make_model().fit(X, y)
+    betas = pd.Series(final[-1].coef_[0], index=FEATURES, name="beta")
+    print("\nStandardized coefficients (full-data fit):")
+    print(betas.sort_values(ascending=False).round(3).to_string())
+
+    plot_betas(betas)
+    plot_metrics_vs_baseline(model_folds, baseline_folds)
+    plot_confusion(y, oof)
+    plot_roc(y, oof)
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
